@@ -1,81 +1,31 @@
 import { Context } from 'telegraf';
 import { User, IUserDocument } from '../models/User';
-
-export interface PointsConfig {
-  // Base awards
-  welcomeBonus: number;
-  baseMessagePoints: number;
-  dailyFirstMessageBonus: number;
-  
-  // Quality multipliers
-  minMessageLength: number;
-  qualityMessageLength: number;
-  qualityMultiplier: number;
-  replyBonus: number;
-  
-  // Streak system
-  streakMultipliers: { days: number; multiplier: number }[];
-  maxStreakMultiplier: number;
-  
-  // Anti-spam protection
-  cooldownSeconds: number;
-  maxPointsPerHour: number;
-  maxPointsPerDay: number;
-  diminishingReturnsThreshold: number;
-  diminishingReturnsFactor: number;
-  
-  // Special bonuses
-  milestoneRewards: { points: number; bonus: number }[];
-  weekendMultiplier: number;
-  nightOwlBonus: { startHour: number; endHour: number; bonus: number };
-}
+import { TaxConfigService } from './TaxConfigService';
+import { ITaxConfig } from '../models/TaxConfig';
 
 export class TaxPointsService {
-  private readonly config: PointsConfig = {
-    // Base awards
-    welcomeBonus: 500,
-    baseMessagePoints: 2,
-    dailyFirstMessageBonus: 50,
-    
-    // Quality multipliers
-    minMessageLength: 5,
-    qualityMessageLength: 30,
-    qualityMultiplier: 1.5,
-    replyBonus: 3,
-    
-    // Streak system
-    streakMultipliers: [
-      { days: 3, multiplier: 1.2 },
-      { days: 7, multiplier: 1.5 },
-      { days: 14, multiplier: 1.8 },
-      { days: 30, multiplier: 2.0 }
-    ],
-    maxStreakMultiplier: 2.5,
-    
-    // Anti-spam protection
-    cooldownSeconds: 30,
-    maxPointsPerHour: 100,
-    maxPointsPerDay: 500,
-    diminishingReturnsThreshold: 20, // messages per hour
-    diminishingReturnsFactor: 0.7,
-    
-    // Special bonuses
-    milestoneRewards: [
-      { points: 1000, bonus: 100 },
-      { points: 5000, bonus: 250 },
-      { points: 10000, bonus: 500 },
-      { points: 25000, bonus: 1000 }
-    ],
-    weekendMultiplier: 1.3,
-    nightOwlBonus: { startHour: 22, endHour: 6, bonus: 1.2 }
-  };
+  private configService = new TaxConfigService();
+
+  constructor() {
+    // Subscribe to configuration changes for real-time updates
+    this.configService.onConfigChange((config) => {
+      console.log(`🔄 Tax points configuration updated to version ${config.version}`);
+    });
+  }
 
   async awardWelcomeBonus(userId: number): Promise<number> {
     try {
       const user = await User.findOne({ userId });
       if (!user) return 0;
 
-      const points = this.config.welcomeBonus;
+      const config = await this.configService.getConfig();
+      
+      if (!config.enableWelcomeBonus) {
+        console.log(`⚠️ Welcome bonus disabled for user ${userId}`);
+        return 0;
+      }
+
+      const points = config.welcomeBonus;
       await user.awardPoints(points);
       
       console.log(`🎉 Welcome bonus: ${points} $TAX awarded to user ${userId}`);
@@ -93,19 +43,21 @@ export class TaxPointsService {
       const user = await User.findOne({ userId: ctx.from.id });
       if (!user || !user.isVerified) return 0;
 
+      const config = await this.configService.getConfig(ctx.chat.id);
+
       // Check cooldown
-      if (!this.canAwardPoints(user)) {
+      if (!this.canAwardPoints(user, config)) {
         return 0;
       }
 
       // Check daily limits
       const groupActivity = user.groupActivity.find(g => g.groupId === ctx.chat!.id);
-      if (groupActivity && !this.canAwardDailyPoints(groupActivity)) {
+      if (groupActivity && !this.canAwardDailyPoints(groupActivity, config)) {
         return 0;
       }
 
       // Calculate base points
-      let points = await this.calculateMessagePoints(user, messageText, ctx);
+      let points = await this.calculateMessagePoints(user, messageText, ctx, config);
       
       if (points <= 0) return 0;
 
@@ -114,10 +66,12 @@ export class TaxPointsService {
       await user.incrementMessages(ctx.chat.id);
 
       // Check for milestones
-      const milestoneBonus = this.checkMilestone(user.taxPoints - points, user.taxPoints);
-      if (milestoneBonus > 0) {
-        await user.awardPoints(milestoneBonus);
-        console.log(`🏆 Milestone bonus: ${milestoneBonus} $TAX for user ${ctx.from.id}`);
+      if (config.enableMilestoneRewards) {
+        const milestoneBonus = this.checkMilestone(user.taxPoints - points, user.taxPoints, config);
+        if (milestoneBonus > 0) {
+          await user.awardPoints(milestoneBonus);
+          console.log(`🏆 Milestone bonus: ${milestoneBonus} $TAX for user ${ctx.from.id}`);
+        }
       }
 
       console.log(`💰 ${points} $TAX awarded to ${ctx.from.first_name} (${ctx.from.id})`);
@@ -128,59 +82,65 @@ export class TaxPointsService {
     }
   }
 
-  private async calculateMessagePoints(user: IUserDocument, messageText: string, ctx: Context): Promise<number> {
-    let points = this.config.baseMessagePoints;
+  private async calculateMessagePoints(user: IUserDocument, messageText: string, ctx: Context, config: ITaxConfig): Promise<number> {
+    let points = config.baseMessagePoints;
 
     // Quality bonus based on message length
-    const qualityMultiplier = this.getQualityMultiplier(messageText);
-    points *= qualityMultiplier;
+    if (config.enableQualityMultiplier) {
+      const qualityMultiplier = this.getQualityMultiplier(messageText, config);
+      points *= qualityMultiplier;
+    }
 
     // Reply bonus
     if ('reply_to_message' in ctx.message! && ctx.message.reply_to_message) {
-      points += this.config.replyBonus;
+      points += config.replyBonus;
     }
 
     // First message of the day bonus
     const isFirstMessageToday = this.isFirstMessageToday(user, ctx.chat!.id);
-    if (isFirstMessageToday) {
-      points += this.config.dailyFirstMessageBonus;
+    if (isFirstMessageToday && config.enableDailyBonus) {
+      points += config.dailyFirstMessageBonus;
       await user.updateStreak(); // Update streak for daily activity
     }
 
     // Streak multiplier
-    const streakMultiplier = this.getStreakMultiplier(user.dailyStreak);
-    points *= streakMultiplier;
+    if (config.enableStreakMultiplier) {
+      const streakMultiplier = this.getStreakMultiplier(user.dailyStreak, config);
+      points *= streakMultiplier;
+    }
 
     // Time-based bonuses
-    const timeMultiplier = this.getTimeMultiplier();
-    points *= timeMultiplier;
+    if (config.enableTimeMultiplier) {
+      const timeMultiplier = this.getTimeMultiplier(config);
+      points *= timeMultiplier;
+    }
 
     // Diminishing returns for excessive messaging
     const hourlyMessages = await this.getHourlyMessageCount(user, ctx.chat!.id);
-    if (hourlyMessages > this.config.diminishingReturnsThreshold) {
-      points *= this.config.diminishingReturnsFactor;
+    if (hourlyMessages > config.diminishingReturnsThreshold) {
+      points *= config.diminishingReturnsFactor;
     }
 
     // Round and ensure minimum
     return Math.max(1, Math.round(points));
   }
 
-  private getQualityMultiplier(messageText: string): number {
-    if (messageText.length < this.config.minMessageLength) {
+  private getQualityMultiplier(messageText: string, config: ITaxConfig): number {
+    if (messageText.length < config.minMessageLength) {
       return 0; // No points for very short messages
     }
     
-    if (messageText.length >= this.config.qualityMessageLength) {
-      return this.config.qualityMultiplier;
+    if (messageText.length >= config.qualityMessageLength) {
+      return config.qualityMultiplier;
     }
     
     return 1; // Base multiplier
   }
 
-  private getStreakMultiplier(streak: number): number {
+  private getStreakMultiplier(streak: number, config: ITaxConfig): number {
     let multiplier = 1;
     
-    for (const threshold of this.config.streakMultipliers) {
+    for (const threshold of config.streakMultipliers) {
       if (streak >= threshold.days) {
         multiplier = threshold.multiplier;
       } else {
@@ -188,10 +148,10 @@ export class TaxPointsService {
       }
     }
     
-    return Math.min(multiplier, this.config.maxStreakMultiplier);
+    return Math.min(multiplier, config.maxStreakMultiplier);
   }
 
-  private getTimeMultiplier(): number {
+  private getTimeMultiplier(config: ITaxConfig): number {
     const now = new Date();
     const hour = now.getHours();
     const isWeekend = now.getDay() === 0 || now.getDay() === 6;
@@ -200,11 +160,11 @@ export class TaxPointsService {
     
     // Weekend bonus
     if (isWeekend) {
-      multiplier *= this.config.weekendMultiplier;
+      multiplier *= config.weekendMultiplier;
     }
     
     // Night owl bonus (late night/early morning)
-    const nightOwl = this.config.nightOwlBonus;
+    const nightOwl = config.nightOwlBonus;
     if (hour >= nightOwl.startHour || hour <= nightOwl.endHour) {
       multiplier *= nightOwl.bonus;
     }
@@ -212,16 +172,16 @@ export class TaxPointsService {
     return multiplier;
   }
 
-  private canAwardPoints(user: IUserDocument): boolean {
+  private canAwardPoints(user: IUserDocument, config: ITaxConfig): boolean {
     if (!user.lastPointAward) return true;
     
-    const cooldownMs = this.config.cooldownSeconds * 1000;
+    const cooldownMs = config.cooldownSeconds * 1000;
     const timeSinceLastAward = Date.now() - user.lastPointAward.getTime();
     
     return timeSinceLastAward >= cooldownMs;
   }
 
-  private canAwardDailyPoints(groupActivity: any): boolean {
+  private canAwardDailyPoints(groupActivity: any, config: ITaxConfig): boolean {
     const today = new Date();
     const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     
@@ -232,7 +192,7 @@ export class TaxPointsService {
       return true;
     }
     
-    return groupActivity.dailyPoints < this.config.maxPointsPerDay;
+    return groupActivity.dailyPoints < config.maxPointsPerDay;
   }
 
   private isFirstMessageToday(user: IUserDocument, groupId: number): boolean {
@@ -259,8 +219,8 @@ export class TaxPointsService {
     return 0;
   }
 
-  private checkMilestone(oldPoints: number, newPoints: number): number {
-    for (const milestone of this.config.milestoneRewards) {
+  private checkMilestone(oldPoints: number, newPoints: number, config: ITaxConfig): number {
+    for (const milestone of config.milestoneRewards) {
       if (oldPoints < milestone.points && newPoints >= milestone.points) {
         return milestone.bonus;
       }
@@ -337,13 +297,18 @@ export class TaxPointsService {
     }
   }
 
-  // Configuration methods for admin
-  updateConfig(newConfig: Partial<PointsConfig>): void {
-    Object.assign(this.config, newConfig);
-    console.log('⚙️ Tax points configuration updated');
+  // Get current configuration for display
+  async getCurrentConfig(groupId?: number): Promise<ITaxConfig> {
+    return await this.configService.getConfig(groupId);
   }
 
-  getConfig(): PointsConfig {
-    return { ...this.config };
+  // Get configuration summary
+  async getConfigSummary(): Promise<string> {
+    return await this.configService.getConfigSummary();
+  }
+
+  // Clear configuration cache (useful for testing)
+  clearConfigCache(): void {
+    this.configService.clearCache();
   }
 }
