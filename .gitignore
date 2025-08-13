@@ -1,4 +1,5 @@
 node_modules/
+admin-panel/
 dist/
 .env
 *.log
